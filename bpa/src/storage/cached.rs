@@ -48,21 +48,31 @@ impl BundleStorage for CachedBundleStorage {
         self.inner.recover(stream).await
     }
 
-    // A cache hit pops the entry: the returned Bytes is then usually
-    // uniquely owned, letting editors mutate it in place via try_into_mut().
-    // The durable copy in the inner backend keeps load() non-destructive
-    // per the BundleStorage contract — a repeated load is simply a cache
-    // miss served by the inner backend, which is also why a miss does not
-    // re-populate the cache.
+    // Cache hit returns a clone (Bytes::clone is a refcount bump, not a
+    // data copy). The entry stays in the cache so that retry paths (forward
+    // failure → re-route → second load) hit the cache rather than going to
+    // the backend. The tradeoff: editors that rewrite the loaded data via
+    // try_into_mut() will see a shared refcount and take the copying
+    // Chunk::flatten path instead of mutating in place. For retry-heavy
+    // workloads (link flapping), avoiding backend I/O on each retry
+    // outweighs the occasional extra copy.
     async fn load(&self, storage_name: &str) -> Result<Option<Bytes>> {
-        if let Some(data) = self.lru.lock().pop(storage_name) {
+        if let Some(data) = self.lru.lock().get(storage_name) {
             metrics::counter!("bpa.store.cache.hits").increment(1);
-            return Ok(Some(data));
+            return Ok(Some(data.clone()));
         }
 
         metrics::counter!("bpa.store.cache.misses").increment(1);
 
-        self.inner.load(storage_name).await
+        // On a miss, fetch from the inner backend and populate the cache
+        // so subsequent loads (retries) benefit.
+        let result = self.inner.load(storage_name).await?;
+        if let Some(ref data) = result
+            && self.is_cacheable(data)
+        {
+            self.lru.lock().put(storage_name.into(), data.clone());
+        }
+        Ok(result)
     }
 
     async fn save(&self, data: Bytes) -> Result<Arc<str>> {
