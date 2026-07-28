@@ -355,7 +355,14 @@ where
                 debug!("Out of order segment received");
                 return self.unexpected_msg(codec::MessageType::XFER_SEGMENT).await;
             }
-            self.ingress_bundle = Some(BytesMut::with_capacity(msg.data.len()));
+            // Pre-size the reassembly buffer to avoid repeated reallocation
+            // for multi-segment bundles. The heuristic targets 8 segments
+            // (covering the common case) capped at the negotiated MRU.
+            let initial_capacity = msg
+                .data
+                .len()
+                .max(self.segment_mtu.saturating_mul(8).min(self.transfer_mru));
+            self.ingress_bundle = Some(BytesMut::with_capacity(initial_capacity));
         } else if self.refusing == Some(msg.transfer_id) {
             // Remaining in-flight segments of a transfer we have refused
             if msg.message_flags.end {
