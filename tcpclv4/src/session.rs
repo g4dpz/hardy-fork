@@ -63,16 +63,34 @@ pub enum Error {
 
 impl Error {
     // Label for the `tcpclv4.session.terminated` metric.
-    fn reason(&self) -> String {
+    fn reason(&self) -> &'static str {
         match self {
-            Error::Terminate(msg) => format!("{:?}", msg.reason_code),
-            Error::Shutdown(code) => format!("{code:?}"),
-            Error::WriterClosed => "writer_closed".to_string(),
-            Error::IngestStopped => "ingest_stopped".to_string(),
-            Error::Hangup => "hangup".to_string(),
-            Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => "hangup".to_string(),
-            Error::Io(_) => "io_error".to_string(),
-            Error::Codec(_) => "codec_error".to_string(),
+            Error::Terminate(msg) => match msg.reason_code {
+                codec::SessionTermReasonCode::Unknown => "peer_unknown",
+                codec::SessionTermReasonCode::IdleTimeout => "peer_idle_timeout",
+                codec::SessionTermReasonCode::VersionMismatch => "peer_version_mismatch",
+                codec::SessionTermReasonCode::Busy => "peer_busy",
+                codec::SessionTermReasonCode::ContactFailure => "peer_contact_failure",
+                codec::SessionTermReasonCode::ResourceExhaustion => "peer_resource_exhaustion",
+                codec::SessionTermReasonCode::Unassigned(_) => "peer_unassigned",
+                codec::SessionTermReasonCode::Private(_) => "peer_private",
+            },
+            Error::Shutdown(code) => match code {
+                codec::SessionTermReasonCode::Unknown => "shutdown_unknown",
+                codec::SessionTermReasonCode::IdleTimeout => "shutdown_idle_timeout",
+                codec::SessionTermReasonCode::VersionMismatch => "shutdown_version_mismatch",
+                codec::SessionTermReasonCode::Busy => "shutdown_busy",
+                codec::SessionTermReasonCode::ContactFailure => "shutdown_contact_failure",
+                codec::SessionTermReasonCode::ResourceExhaustion => "shutdown_resource_exhaustion",
+                codec::SessionTermReasonCode::Unassigned(_) => "shutdown_unassigned",
+                codec::SessionTermReasonCode::Private(_) => "shutdown_private",
+            },
+            Error::WriterClosed => "writer_closed",
+            Error::IngestStopped => "ingest_stopped",
+            Error::Hangup => "hangup",
+            Error::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => "hangup",
+            Error::Io(_) => "io_error",
+            Error::Codec(_) => "codec_error",
         }
     }
 }
