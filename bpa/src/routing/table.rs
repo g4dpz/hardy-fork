@@ -353,14 +353,14 @@ fn sorted_insert<'a>(peers: &mut SmallVec<[(u32, &'a Eid); 4]>, peer: u32, next_
 // stored as a single key: any set-level score ranks every member by one
 // aggregate, letting a broad member drag a specific sibling behind routes the
 // sibling strictly beats. A union route is shorthand for one route per member.
-fn flatten(pattern: EidPattern) -> Vec<EidPattern> {
+fn flatten(pattern: EidPattern) -> SmallVec<[EidPattern; 1]> {
     match pattern {
         EidPattern::Set(items) if items.len() > 1 => items
             .into_vec()
             .into_iter()
             .map(|item| EidPattern::Set([item].into()))
             .collect(),
-        pattern => Vec::from([pattern]),
+        pattern => SmallVec::from([pattern]),
     }
 }
 
