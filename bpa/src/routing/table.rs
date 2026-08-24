@@ -109,19 +109,25 @@ impl RouteTable {
             action: Action::Internal(InternalAction::AdminEndpoint),
         };
 
-        let mut admin_endpoints = BTreeMap::new();
-        if let Some(node_name) = &node_ids.dtn {
-            let admin_eid: Eid = node_name.clone().into();
-            admin_endpoints.insert(admin_eid.into(), [entry.clone()].into());
-        }
+        // Pre-collect admin endpoints for efficient BTreeMap construction
+        let admin_entries: Vec<_> = [
+            node_ids.dtn.as_ref().map(|node_name| {
+                let admin_eid: Eid = node_name.clone().into();
+                (admin_eid.into(), [entry.clone()].into())
+            }),
+            node_ids.ipn.as_ref().map(|node_number| {
+                let admin_eid: Eid = (*node_number).into();
+                (admin_eid.into(), [entry].into())
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
 
-        if let Some(node_number) = &node_ids.ipn {
-            let admin_eid: Eid = (*node_number).into();
-            admin_endpoints.insert(admin_eid.into(), [entry].into());
-        }
+        // Build BTreeMap from pre-collected sorted entries for optimal tree construction
+        let admin_endpoints: BTreeMap<_, _> = admin_entries.into_iter().collect();
 
-        let mut routes = BTreeMap::new();
-        routes.insert(0, admin_endpoints);
+        let routes = [(0, admin_endpoints)].into_iter().collect();
 
         Self { routes, node_ids }
     }
