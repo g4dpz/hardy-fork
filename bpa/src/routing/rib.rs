@@ -978,4 +978,234 @@ mod tests {
             "Route add must wake the Waiting poller even when no peer queue was preempted"
         );
     }
+
+    #[tokio::test]
+    async fn test_routing_table_snapshot_management() {
+        let rib = make_rib();
+
+        // Get initial snapshot
+        let initial_snapshot = rib.snapshot.load();
+
+        // Add a route - should create new snapshot
+        rib.add(
+            "ipn:0.99.*".parse().unwrap(),
+            "snapshot_test",
+            Action::Route(RouteAction::Via("ipn:0.2.0".parse().unwrap())),
+            10,
+        )
+        .await
+        .unwrap();
+
+        let new_snapshot = rib.snapshot.load();
+
+        // Verify snapshot is actually different (not just same reference)
+        assert!(
+            !Arc::ptr_eq(&initial_snapshot, &new_snapshot),
+            "Snapshot should be updated to new instance"
+        );
+
+        // Remove the route - should create another snapshot
+        rib.remove(
+            "ipn:0.99.*".parse().unwrap(),
+            "snapshot_test",
+            Action::Route(RouteAction::Via("ipn:0.2.0".parse().unwrap())),
+            10,
+        )
+        .await;
+
+        let final_snapshot = rib.snapshot.load();
+        assert!(
+            !Arc::ptr_eq(&new_snapshot, &final_snapshot),
+            "Snapshot should be updated after removal"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_early_exit_routing_patterns() {
+        let rib = make_rib();
+
+        // Add routes with different priorities to test early exit behavior
+        rib.add(
+            "ipn:0.50.*".parse().unwrap(),
+            "high_priority",
+            Action::Route(RouteAction::Via("ipn:0.2.0".parse().unwrap())),
+            5, // High priority (lower number)
+        )
+        .await
+        .unwrap();
+
+        rib.add(
+            "ipn:*.*".parse().unwrap(),
+            "low_priority",
+            Action::Route(RouteAction::Via("ipn:0.3.0".parse().unwrap())),
+            10, // Lower priority (higher number)
+        )
+        .await
+        .unwrap();
+
+        // Test that specific route (higher priority) is chosen over default
+        let mut bundle = make_bundle("ipn:0.50.1");
+        let result = rib.find(&mut bundle);
+
+        match result {
+            Some(DispatchAction::Forward(_)) => {
+                // Should use high priority route
+                assert!(bundle.metadata.read_only.next_hop.is_some());
+                let next_hop = bundle.metadata.read_only.next_hop.as_ref().unwrap();
+                assert_eq!(next_hop, &"ipn:0.2.0".parse::<Eid>().unwrap());
+            }
+            other => panic!("Expected forward action, got: {:?}", other),
+        }
+
+        // Test that default route is used for non-matching destination
+        let mut bundle2 = make_bundle("ipn:0.99.1");
+        let result2 = rib.find(&mut bundle2);
+
+        match result2 {
+            Some(DispatchAction::Forward(_)) => {
+                let next_hop = bundle2.metadata.read_only.next_hop.as_ref().unwrap();
+                assert_eq!(next_hop, &"ipn:0.3.0".parse::<Eid>().unwrap());
+            }
+            other => panic!(
+                "Expected forward action for default route, got: {:?}",
+                other
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_routing_performance_with_many_routes() {
+        let rib = make_rib();
+
+        // Add many routes to test performance characteristics
+        let route_count = 100;
+        for i in 0..route_count {
+            rib.add(
+                format!("ipn:0.{}.0", i).parse().unwrap(),
+                "perf_test",
+                Action::Route(RouteAction::Via(format!("ipn:0.{}.1", i).parse().unwrap())),
+                i % 10, // Distribute across priorities
+            )
+            .await
+            .unwrap();
+        }
+
+        // Test that routing lookups remain fast
+        let start = std::time::Instant::now();
+        let mut successful_routes = 0;
+
+        for i in 0..route_count {
+            let mut bundle = make_bundle(&format!("ipn:0.{}.0", i));
+            if rib.find(&mut bundle).is_some() {
+                successful_routes += 1;
+            }
+        }
+
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            successful_routes, route_count,
+            "Should route all test bundles"
+        );
+        assert!(
+            elapsed.as_millis() < 50,
+            "Routing {} bundles took too long: {:?}ms",
+            route_count,
+            elapsed.as_millis()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_by_source_performance() {
+        let rib = make_rib();
+
+        // Add many routes from same source
+        let source = "bulk_test_source";
+        let route_count = 50;
+
+        for i in 0..route_count {
+            rib.add(
+                format!("ipn:0.{}.0", i).parse().unwrap(),
+                source,
+                Action::Route(RouteAction::Via(format!("ipn:0.{}.1", i).parse().unwrap())),
+                0,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Verify routes were added
+        let snapshot_before = rib.snapshot.load();
+
+        // Remove all routes from source - should be efficient
+        let start = std::time::Instant::now();
+        rib.remove_by_source(source).await;
+        let elapsed = start.elapsed();
+
+        // Should complete quickly even with many routes
+        assert!(
+            elapsed.as_millis() < 20,
+            "Removing {} routes by source took too long: {:?}ms",
+            route_count,
+            elapsed.as_millis()
+        );
+
+        // Verify snapshot was updated
+        let snapshot_after = rib.snapshot.load();
+        assert!(
+            !Arc::ptr_eq(&snapshot_before, &snapshot_after),
+            "Snapshot should be updated after bulk removal"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_routing_table_capacity_optimizations() {
+        let rib = make_rib();
+
+        // Test that routing table operations scale well
+        let priorities = [0, 10, 20, 30];
+        let subnets_per_priority = 25;
+
+        // Add routes distributed across priorities
+        for &priority in &priorities {
+            for subnet in 0..subnets_per_priority {
+                rib.add(
+                    format!("ipn:0.{}.0", subnet).parse().unwrap(),
+                    "capacity_test",
+                    Action::Route(RouteAction::Via(
+                        format!("ipn:0.{}.1", subnet).parse().unwrap(),
+                    )),
+                    priority,
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        // Test impacted_vias performance with realistic data
+        let start = std::time::Instant::now();
+        {
+            let table = rib.table.lock();
+            let pattern: EidPattern = "ipn:*.*".parse().unwrap();
+
+            // Test different priority thresholds
+            for &priority in &priorities {
+                let vias = table.impacted_vias(&pattern, priority);
+                assert!(
+                    !vias.is_empty() || priority > *priorities.iter().max().unwrap(),
+                    "Should find vias for priority {} in populated table",
+                    priority
+                );
+            }
+        }
+        let elapsed = start.elapsed();
+
+        // Should handle impacted_vias calculations efficiently
+        assert!(
+            elapsed.as_millis() < 10,
+            "Impact analysis took too long: {:?}ms for {} routes",
+            elapsed.as_millis(),
+            priorities.len() * subnets_per_priority
+        );
+    }
 }
