@@ -229,7 +229,14 @@ impl RouteTable {
     }
 
     pub(super) fn impacted_vias(&self, pattern: &EidPattern, priority: u32) -> HashSet<Eid> {
-        let mut vias = HashSet::new();
+        // Pre-size HashSet based on routes at this priority level and higher
+        let capacity_hint = self
+            .routes
+            .range(priority..)
+            .map(|(_, entry)| entry.len())
+            .sum::<usize>()
+            .min(16);
+        let mut vias = HashSet::with_capacity(capacity_hint);
         for (_, entry) in self.routes.range(priority..) {
             for (p, actions) in entry {
                 if p.is_subset(pattern) {
