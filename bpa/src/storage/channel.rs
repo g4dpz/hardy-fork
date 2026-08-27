@@ -71,11 +71,11 @@ use crate::{
 #[repr(usize)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ChannelState {
-    /// Fast path is available. Senders try to send directly to the flume channel.
+    /// Fast path is available. Senders try to send directly to the in-memory channel.
     Open = 0,
 
     /// Fast path is closed. The background poller is draining bundles from
-    /// persistent storage into the flume channel.
+    /// persistent storage into the in-memory channel.
     Draining = 1,
 
     /// New bundles arrived while the poller was draining. This signals to the
@@ -117,6 +117,11 @@ struct Shared {
     tx: hardy_async::closeable::Sender<Bundle>,
     status: BundleStatus,
     notify: Arc<Notify>,
+    // Test-only state-transition signal: the state machine is otherwise
+    // unobservable without polling, and the test style guide requires
+    // synchronizing on the event itself.
+    #[cfg(test)]
+    state_notify: Notify,
 }
 
 impl Shared {
@@ -130,6 +135,8 @@ impl Shared {
     #[inline]
     fn store_state(&self, state: ChannelState, ordering: Ordering) {
         self.state.store(state.as_usize(), ordering);
+        #[cfg(test)]
+        self.state_notify.notify_one();
     }
 
     /// Atomically compare-and-swap: if current == expected, set to new.
@@ -144,10 +151,16 @@ impl Shared {
         success: Ordering,
         failure: Ordering,
     ) -> Result<ChannelState, ChannelState> {
-        self.state
+        let r = self
+            .state
             .compare_exchange(expected.as_usize(), new.as_usize(), success, failure)
             .map(ChannelState::from_usize)
-            .map_err(ChannelState::from_usize)
+            .map_err(ChannelState::from_usize);
+        #[cfg(test)]
+        if r.is_ok() {
+            self.state_notify.notify_one();
+        }
+        r
     }
 }
 
@@ -186,6 +199,9 @@ impl Sender {
     /// ownership of the bundle. A `Full` buffer is **not** an error from
     /// the caller's perspective — the bundle is in storage and will be
     /// drained by the poller.
+    // SendError deliberately carries the bundle so the caller recovers
+    // ownership; boxing it to shrink the Err variant would tax every send.
+    #[allow(clippy::result_large_err)]
     pub async fn send(&self, mut bundle: Bundle) -> Result<(), SendError> {
         // Conditional move into this queue from the sender's snapshot: a
         // duplicate copy of a bundle that has already moved on must lose
@@ -286,6 +302,8 @@ impl Store {
             tx,
             status: status.clone(),
             notify: Arc::new(Notify::new()),
+            #[cfg(test)]
+            state_notify: Notify::new(),
         });
 
         let store = self.clone();
@@ -432,7 +450,7 @@ mod tests {
 
     fn make_bundle(n: u32) -> Bundle {
         Bundle {
-            bundle: hardy_bpv7::bundle::Bundle {
+            bundle: crate::bundle::Bpv7Bundle {
                 id: hardy_bpv7::bundle::Id {
                     source: format!("ipn:0.{n}.1").parse().unwrap(),
                     timestamp: hardy_bpv7::creation_timestamp::CreationTimestamp::now(),
@@ -469,26 +487,29 @@ mod tests {
     // The delivery contract requires the bundle to already exist in metadata
     // storage before it is offered to the channel; insert it with the
     // caller-side snapshot status, as every production sender does.
+    #[allow(clippy::result_large_err)] // mirrors Sender::send's signature
     async fn send(tx: &Sender, bundle: Bundle) -> Result<(), SendError> {
         tx.store.insert_metadata(&bundle).await;
         tx.send(bundle).await
     }
 
-    // Poll until the channel reaches `target`, or panic after a generous
-    // deadline. Replaces fixed sleeps so the tests stay robust on slow CI.
+    // Await the channel reaching `target`, synchronized on the state
+    // machine's transition signal; the timeout only bounds a regression.
+    // `notify_one` stores a permit, so a transition landing between the
+    // state check and the await is never lost.
     async fn wait_for_state(tx: &Sender, target: ChannelState) {
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-        loop {
-            let state = tx.state();
-            if state == target {
-                return;
+        tokio::time::timeout(tokio::time::Duration::from_secs(30), async {
+            while tx.state() != target {
+                tx.shared.state_notify.notified().await;
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "Timed out waiting for state {target:?}, got {state:?}"
-            );
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "Timed out waiting for state {target:?}, got {:?}",
+                tx.state()
+            )
+        })
     }
 
     // The fast path must re-open after draining even for tiny capacities.
@@ -579,47 +600,60 @@ mod tests {
         // Wait for the poller's initial cycle before overflowing the buffer.
         wait_for_state(&tx, ChannelState::Open).await;
 
-        // Now send enough to overflow: cap=16, send 17
-        for i in 1..=17u32 {
+        // Now send enough to overflow: one more than the buffer holds.
+        let bundles = cap + 1;
+        for i in 1..=bundles as u32 {
             send(&tx, make_bundle(i)).await.unwrap();
         }
 
-        // Drain ALL bundles (unique + duplicates) and tombstone each.
-        // The poller re-opens when flume.len() < cap/2 and metadata is empty.
+        // Drain until every unique bundle has been delivered and
+        // tombstoned; each recv is event-driven, the timeout only bounds a
+        // regression.
         let mut seen = HashSet::new();
-        let drain_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-        loop {
-            match tokio::time::timeout(tokio::time::Duration::from_millis(200), rx.recv()).await {
-                Ok(Ok(b)) => {
-                    store.tombstone_metadata(&b.bundle.id).await;
-                    seen.insert(b.bundle.id);
-                }
-                Ok(Err(_)) => {
-                    // Channel closed
-                    break;
-                }
-                Err(_) if seen.len() >= 17 => {
-                    // No bundle for 200ms after full delivery — channel quiesced
-                    break;
-                }
-                Err(_) => {
-                    // Delivery can stall past 200ms under load — keep waiting
-                    // until the deadline
-                }
-            }
-            if tokio::time::Instant::now() > drain_deadline {
-                break;
-            }
+        while seen.len() < bundles {
+            let b = tokio::time::timeout(tokio::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("Timed out waiting for a bundle delivery")
+                .expect("Channel closed mid-drain");
+            store.tombstone_metadata(&b.bundle.id).await;
+            seen.insert(b.bundle.id);
         }
-
-        assert!(
-            seen.len() >= 17,
-            "Should have seen all 17 bundles, got {}",
-            seen.len()
+        assert_eq!(
+            seen.len(),
+            bundles,
+            "Should have seen all {bundles} bundles"
         );
 
-        // Wait for the poller to see empty metadata and re-open the fast path.
-        wait_for_state(&tx, ChannelState::Open).await;
+        // The poller re-opens once metadata is empty and the buffer is
+        // below half capacity; duplicate deliveries may still be in
+        // flight, so keep draining them while awaiting the transition.
+        // The timeout only bounds a regression.
+        tokio::time::timeout(tokio::time::Duration::from_secs(30), async {
+            loop {
+                let notified = tx.shared.state_notify.notified();
+                if tx.state() == ChannelState::Open {
+                    break;
+                }
+                tokio::select! {
+                    _ = notified => {}
+                    r = rx.recv() => {
+                        // The sender stays alive until after this loop, so a
+                        // recv error means the channel died mid-test; fail
+                        // immediately rather than spinning on a ready Err arm
+                        // until the outer timeout.
+                        let b = r.expect("Channel disconnected while awaiting re-open");
+                        store.tombstone_metadata(&b.bundle.id).await;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "Timed out waiting for the fast path to re-open, got {:?}",
+                tx.state()
+            )
+        });
 
         drop(rx);
         tx.close();
@@ -748,7 +782,7 @@ mod tests {
     }
 
     // Bundles sent in sequence should all arrive, preserving the set.
-    // Strict FIFO is guaranteed on the fast path (flume) and by received_at
+    // Strict FIFO is guaranteed on the fast path (in-memory channel) and by received_at
     // ordering on the slow path, but the concurrent poller makes strict
     // ordering non-deterministic across paths in a test environment.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

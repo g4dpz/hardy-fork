@@ -151,8 +151,22 @@ impl Dispatcher {
         }
     }
 
+    // Every drop is a terminal resolution, claimed with a conditional
+    // tombstone. Callers own their bundle through the pipeline's claim
+    // discipline, but the reaper expires bundles regardless of owner, so
+    // any drop can race it, and it races them. Losing the claim means
+    // another resolver's deletion report has gone out; this one stays
+    // silent rather than contradict it. Callers therefore pass a bundle
+    // whose metadata is already stored, with a current status snapshot.
     #[cfg_attr(feature = "instrument", instrument(skip(self, bundle)))]
     pub async fn drop_bundle(&self, bundle: bundle::Bundle, reason: ReasonCode) {
+        if !self.store.tombstone_if(&bundle).await {
+            debug!(
+                "Drop of bundle {} lost the resolution race, ignored",
+                bundle.bundle.id
+            );
+            return;
+        }
         metrics::counter!("bpa.bundle.dropped", "reason" => crate::otel_metrics::reason_label(&reason)).increment(1);
         self.report_bundle_deletion(&bundle, reason).await;
         self.delete_bundle(bundle).await
@@ -203,14 +217,14 @@ impl Dispatcher {
 
     fn key_provider(
         &self,
-    ) -> impl Fn(&hardy_bpv7::bundle::Bundle, &[u8]) -> Box<dyn hardy_bpv7::bpsec::key::KeySource> + '_
+    ) -> impl Fn(&hardy_bpv7::Bundle, &[u8]) -> Box<dyn hardy_bpv7::bpsec::key::KeySource> + Clone + '_
     {
         |bundle, data| self.key_provider.key_source(bundle, data)
     }
 
     fn key_source(
         &self,
-        bundle: &hardy_bpv7::bundle::Bundle,
+        bundle: &hardy_bpv7::Bundle,
         data: &[u8],
     ) -> Box<dyn hardy_bpv7::bpsec::key::KeySource> {
         self.key_provider.key_source(bundle, data)
