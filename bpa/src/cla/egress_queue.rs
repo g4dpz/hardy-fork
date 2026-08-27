@@ -55,7 +55,8 @@ pub fn new_queue_set(
     });
 
     let mut h: HashMap<Option<u32>, Arc<dyn policy::EgressQueue>> =
-        [(None, EgressQueue::create(shared.clone(), None))].into();
+        HashMap::with_capacity(lane_count as usize + 1);
+    h.insert(None, EgressQueue::create(shared.clone(), None));
     for i in 0..lane_count {
         h.insert(Some(i), EgressQueue::create(shared.clone(), Some(i)));
     }

@@ -141,36 +141,7 @@ impl Rib {
         let result =
             table.find_recurse(&bundle.bundle.destination, true, &mut RecursionTrail::new())?;
 
-        // Handle reflection case by doing a separate lookup to avoid lifetime issues
-        if matches!(result, LookupResult::Reflect) {
-            let previous = bundle
-                .previous_node()
-                .unwrap_or_else(|| bundle.bundle.id.source.clone());
-
-            // Do the reflected lookup and immediately convert to DispatchAction
-            if let Some(reflected_result) =
-                table.find_recurse(&previous, false, &mut RecursionTrail::new())
-            {
-                match reflected_result {
-                    LookupResult::AdminEndpoint => return Some(DispatchAction::AdminEndpoint),
-                    LookupResult::Deliver(service) => {
-                        return Some(DispatchAction::Deliver(service));
-                    }
-                    LookupResult::Drop(reason) => return Some(DispatchAction::Drop(reason)),
-                    LookupResult::Forward(peer, next_hop) => {
-                        bundle.metadata.read_only.next_hop = Some(next_hop.clone());
-                        return Some(DispatchAction::Forward(peer));
-                    }
-                    LookupResult::ForwardEcmp(peers) => {
-                        return self.select_peer(peers, &bundle.bundle, &mut bundle.metadata);
-                    }
-                    LookupResult::Reflect => return None,
-                }
-            }
-            return None;
-        }
-
-        // Handle non-reflection cases
+        // Fast path for common non-reflection cases (majority of traffic)
         match result {
             LookupResult::AdminEndpoint => Some(DispatchAction::AdminEndpoint),
             LookupResult::Deliver(service) => Some(DispatchAction::Deliver(service)),
@@ -182,7 +153,34 @@ impl Rib {
             LookupResult::ForwardEcmp(peers) => {
                 self.select_peer(peers, &bundle.bundle, &mut bundle.metadata)
             }
-            LookupResult::Reflect => None, // This should never happen due to the check above
+            LookupResult::Reflect => {
+                // Only execute expensive reflection logic when actually needed
+                let previous = bundle
+                    .previous_node()
+                    .unwrap_or_else(|| bundle.bundle.id.source.clone());
+
+                // Do the reflected lookup and immediately convert to DispatchAction
+                if let Some(reflected_result) =
+                    table.find_recurse(&previous, false, &mut RecursionTrail::new())
+                {
+                    match reflected_result {
+                        LookupResult::AdminEndpoint => return Some(DispatchAction::AdminEndpoint),
+                        LookupResult::Deliver(service) => {
+                            return Some(DispatchAction::Deliver(service));
+                        }
+                        LookupResult::Drop(reason) => return Some(DispatchAction::Drop(reason)),
+                        LookupResult::Forward(peer, next_hop) => {
+                            bundle.metadata.read_only.next_hop = Some(next_hop.clone());
+                            return Some(DispatchAction::Forward(peer));
+                        }
+                        LookupResult::ForwardEcmp(peers) => {
+                            return self.select_peer(peers, &bundle.bundle, &mut bundle.metadata);
+                        }
+                        LookupResult::Reflect => return None,
+                    }
+                }
+                None
+            }
         }
     }
 
@@ -231,9 +229,9 @@ impl Rib {
         let pattern = self.expand_pattern(pattern);
         let action = self.expand_action(action);
 
-        // Mutate the authoritative table in place, then publish a clone
-        // to the snapshot for readers. The deep copy is acceptable here:
-        // route mutations are management-plane, not per-bundle.
+        // Mutate the authoritative table in place, then create optimized snapshot.
+        // We minimize deep cloning by creating a new snapshot only when the table
+        // structure actually changes (successful insertion).
         let vias = {
             let mut table = self.table.lock();
 
@@ -246,6 +244,8 @@ impl Rib {
             }
 
             let vias = table.impacted_vias(&pattern, priority);
+
+            // Only clone when we successfully modified the table
             self.snapshot.store(Arc::new(table.clone()));
 
             debug!("Adding route {pattern} => {action}, priority {priority}, source '{source}'");

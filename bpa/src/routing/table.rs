@@ -109,19 +109,25 @@ impl RouteTable {
             action: Action::Internal(InternalAction::AdminEndpoint),
         };
 
-        let mut admin_endpoints = BTreeMap::new();
-        if let Some(node_name) = &node_ids.dtn {
-            let admin_eid: Eid = node_name.clone().into();
-            admin_endpoints.insert(admin_eid.into(), [entry.clone()].into());
-        }
+        // Pre-collect admin endpoints for efficient BTreeMap construction
+        let admin_entries: Vec<_> = [
+            node_ids.dtn.as_ref().map(|node_name| {
+                let admin_eid: Eid = node_name.clone().into();
+                (admin_eid.into(), [entry.clone()].into())
+            }),
+            node_ids.ipn.as_ref().map(|node_number| {
+                let admin_eid: Eid = (*node_number).into();
+                (admin_eid.into(), [entry].into())
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
 
-        if let Some(node_number) = &node_ids.ipn {
-            let admin_eid: Eid = (*node_number).into();
-            admin_endpoints.insert(admin_eid.into(), [entry].into());
-        }
+        // Build BTreeMap from pre-collected sorted entries for optimal tree construction
+        let admin_endpoints: BTreeMap<_, _> = admin_entries.into_iter().collect();
 
-        let mut routes = BTreeMap::new();
-        routes.insert(0, admin_endpoints);
+        let routes = [(0, admin_endpoints)].into_iter().collect();
 
         Self { routes, node_ids }
     }
@@ -223,7 +229,14 @@ impl RouteTable {
     }
 
     pub(super) fn impacted_vias(&self, pattern: &EidPattern, priority: u32) -> HashSet<Eid> {
-        let mut vias = HashSet::new();
+        // Pre-size HashSet based on routes at this priority level and higher
+        let capacity_hint = self
+            .routes
+            .range(priority..)
+            .map(|(_, entry)| entry.len())
+            .sum::<usize>()
+            .min(16);
+        let mut vias = HashSet::with_capacity(capacity_hint);
         for (_, entry) in self.routes.range(priority..) {
             for (p, actions) in entry {
                 if p.is_subset(pattern) {
@@ -353,14 +366,14 @@ fn sorted_insert<'a>(peers: &mut SmallVec<[(u32, &'a Eid); 4]>, peer: u32, next_
 // stored as a single key: any set-level score ranks every member by one
 // aggregate, letting a broad member drag a specific sibling behind routes the
 // sibling strictly beats. A union route is shorthand for one route per member.
-fn flatten(pattern: EidPattern) -> Vec<EidPattern> {
+fn flatten(pattern: EidPattern) -> SmallVec<[EidPattern; 1]> {
     match pattern {
         EidPattern::Set(items) if items.len() > 1 => items
             .into_vec()
             .into_iter()
             .map(|item| EidPattern::Set([item].into()))
             .collect(),
-        pattern => Vec::from([pattern]),
+        pattern => SmallVec::from([pattern]),
     }
 }
 
