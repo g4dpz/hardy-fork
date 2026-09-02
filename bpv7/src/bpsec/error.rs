@@ -1,6 +1,8 @@
-use super::*;
+use alloc::{boxed::Box, string::String};
+
 use thiserror::Error;
 
+use crate::bpsec::{Context, key};
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("Block is not the target of a BCB")]
@@ -33,8 +35,11 @@ pub enum Error {
     #[error("The target block has a CRC")]
     CrcPresent,
 
-    #[error("BCBs must not target other BCBs, the primary block, or BIBs that don't share targets")]
+    #[error("BCBs must not target other BCBs or the primary block")]
     InvalidBCBTarget,
+
+    #[error("A BCB targeting a BIB must share at least one target with it")]
+    BCBMustShareTarget,
 
     #[error(
         "Processing failed on an extension block that has 'Delete block on failure' flag set, but is the target of a BCB"
@@ -119,10 +124,23 @@ pub enum Error {
     },
 
     #[error(transparent)]
-    InvalidCBOR(#[from] hardy_cbor::decode::Error),
+    InvalidCBOR(hardy_cbor::decode::Error),
 
     #[error("Underlying cryptographic operation failed: {0}")]
     Algorithm(String),
+}
+
+// Manual rather than `#[from]`: an `UnexpectedTag` from an `Untagged`
+// decode is an RFC 9172 §4 canonical-encoding violation in this domain,
+// so it surfaces as `NotCanonical` (see `crate::error` for the
+// rationale).
+impl From<hardy_cbor::decode::Error> for Error {
+    fn from(e: hardy_cbor::decode::Error) -> Self {
+        match e {
+            hardy_cbor::decode::Error::UnexpectedTag => Self::NotCanonical,
+            e => Self::InvalidCBOR(e),
+        }
+    }
 }
 
 impl crate::error::HasInvalidField for Error {

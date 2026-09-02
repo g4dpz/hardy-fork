@@ -230,8 +230,8 @@ impl Chunk {
         bundle: Option<&mut bundle::Bundle>,
     ) -> Vec<Chunk> {
         // Separate unchanged and new extension chunks
-        let mut unchanged: Vec<(u64, Range<usize>)> = Vec::new();
-        let mut new_chunks: Vec<(u64, Box<[u8]>)> = Vec::new();
+        let mut unchanged: Vec<(u64, Range<usize>)> = Vec::with_capacity(extensions.len());
+        let mut new_chunks: Vec<(u64, Box<[u8]>)> = Vec::with_capacity(extensions.len());
 
         for (block_number, chunk) in extensions {
             match chunk {
@@ -243,8 +243,9 @@ impl Chunk {
         // Sort unchanged by source position
         unchanged.sort_by_key(|(_, range)| range.start);
 
-        // Sort new chunks by size descending for best-fit gap filling
-        new_chunks.sort_by_key(|(_, b)| core::cmp::Reverse(b.len()));
+        // Sort new chunks by size descending for best-fit gap filling, then
+        // block number ascending as a tiebreak for deterministic output.
+        new_chunks.sort_by_key(|(bn, b)| (core::cmp::Reverse(b.len()), *bn));
 
         // Build ordered extension list: try to fill gaps with matching-size New chunks
         let mut ordered: Vec<(u64, Chunk)> = Vec::with_capacity(unchanged.len() + new_chunks.len());
@@ -1066,7 +1067,7 @@ impl<'a> Editor<'a> {
         // age / hop_count) is not Editor's job — `Bundle`
         // doesn't carry those slots. Callers that want the extracted values
         // re-interpret the rebuilt blocks themselves (a hardy-bpa concern).
-        let mut ext_chunks = Vec::new();
+        let mut ext_chunks = Vec::with_capacity(self.blocks.len());
         for (block_number, block_template) in core::mem::take(&mut self.blocks) {
             let (block, chunk) = self.build_chunk(block_number, block_template)?;
             blocks_out.insert(block_number, block);
@@ -1137,7 +1138,7 @@ impl<'a> Editor<'a> {
         let payload_block = self.blocks.remove(&1).expect("No payload block!");
 
         // Build extension chunks
-        let mut ext_chunks = Vec::new();
+        let mut ext_chunks = Vec::with_capacity(self.blocks.len());
         for (block_number, block_template) in core::mem::take(&mut self.blocks) {
             let (_, chunk) = self.build_chunk(block_number, block_template)?;
             ext_chunks.push((block_number, chunk));
