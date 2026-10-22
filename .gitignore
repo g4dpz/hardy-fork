@@ -10,3 +10,7 @@ bpa-server/certs/
 # MkDocs
 /site/
 /.venv/
+
+# Agent working artifacts (task reports, plans) and worktrees
+/.agents/
+/.worktrees/
