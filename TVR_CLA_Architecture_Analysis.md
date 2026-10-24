@@ -547,4 +547,4 @@ The key success factors for an LTP-CLA implementation are:
 
 ---
 
-*Generated from Hardy DTN implementation analysis - commit 52ad76b2 ("Merge pull request #756 from EmbryoSpace/oci-bpa-server-file-cla")*
+*Generated from Hardy DTN implementation analysis - commit 8461a361 ("chore: ignore agent artifacts and add editor workspace file")*
