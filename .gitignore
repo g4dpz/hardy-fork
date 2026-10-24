@@ -14,3 +14,5 @@ bpa-server/certs/
 # Agent working artifacts (task reports, plans) and worktrees
 /.agents/
 /.worktrees/
+# Local multi-root editor workspace (machine-specific folder paths)
+/hardy-fork.code-workspace
