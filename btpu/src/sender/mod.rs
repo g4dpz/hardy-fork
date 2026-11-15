@@ -9,15 +9,18 @@ mod pack;
 mod pdu;
 mod queue;
 mod segmenter;
+mod stats;
 
 use alloc::{
     boxed::Box,
     collections::{BTreeMap, VecDeque},
     vec::Vec,
 };
-#[cfg(feature = "tower")]
-use core::task::Waker;
-use core::{fmt, iter::from_fn};
+use core::{
+    fmt,
+    iter::from_fn,
+    task::{Context, Poll, Waker},
+};
 
 use bytes::Bytes;
 #[cfg(feature = "rand")]
@@ -26,6 +29,7 @@ use smallvec::SmallVec;
 
 #[cfg(feature = "tower")]
 pub use self::options::SendRequest;
+use self::stats::SenderStats;
 pub use self::{
     config::{
         BundleFraming, LinkFraming, PduSize, SegmentCutStrategy, SendQueueHighWatermark,
@@ -34,10 +38,11 @@ pub use self::{
     error::{Error, Result},
     id::{SendHandle, SendId, SendKind},
     options::{NextPduOptions, SendOptions},
-    pdu::{Carried, CarriedList, Pdu},
+    pdu::{Carried, CarriedList, Pdu, PduSlices, PduSlicesIter},
 };
 use self::{
     id::LocalId,
+    pack::Scan,
     queue::{Assembly, Order, QueueEntry, Queued, Seq},
     segmenter::QueuedTransfer,
 };
@@ -68,15 +73,19 @@ enum Unsegmented {
 ///
 /// # Transfer window
 ///
-/// A segmented bundle takes a Section 5 window slot when it is enqueued and
-/// gives it back when its Transfer End is packed into a PDU by
+/// A segmented bundle takes a Section 5 transfer number when it is enqueued
+/// and releases it when its Transfer End is packed into a PDU by
 /// [`Self::next_pdu`]: a unidirectional link offers no acknowledgement to
 /// anchor an explicit completion call to, and once the End has left the
 /// queue the sender has nothing further to emit for the transfer.  The only
 /// other way out of the window is [`Self::cancel`].  The window is enforced
 /// on the span of outstanding numbers, not their count: a new transfer is
 /// refused while its number would push the oldest outstanding transfer out
-/// of the window, so draining the queue in order is what frees it.
+/// of the window, so draining the queue in order is what opens it.  One
+/// transfer that is slow to finish holds the window at its number: once
+/// the `window_size - 1` numbers after it are taken, no transfer can begin,
+/// however many of those have finished.  So `window_size` concurrent
+/// producers are not each guaranteed admission.
 ///
 /// # Loss protection
 ///
@@ -101,9 +110,9 @@ enum Unsegmented {
 /// bare bundle frames for a peer that accepts them (see
 /// [`BundleFraming::Bare`] for the padding caveat).
 ///
-/// Every outbound unit, bare frames included, passes through the one
-/// send queue: a bare frame is emitted in arrival order behind the
-/// messages queued before it, counts against the [`SendQueueHighWatermark`], and is
+/// Every outbound unit, bare frames included, passes through the one send
+/// queue: a bare frame is emitted in arrival order behind the messages
+/// queued before it, counts against the [`SendQueueHighWatermark`], and is
 /// visible to whatever schedules that queue.  Writing bare bundles to the
 /// link around the sender would instead let them race and starve the
 /// transfers queued here.
@@ -114,8 +123,11 @@ enum Unsegmented {
 /// [`Self::push`] rather than copying them, and copies their bytes into
 /// each PDU as it is packed, except that [`Self::next_pdu`] and
 /// [`Self::next_pdu_into`] return a bare bundle frame as the buffer that
-/// was enqueued.  A bundle's buffers are released once its
-/// last bytes are packed, or when it is cancelled.  The one other copy
+/// was enqueued, and [`Self::next_pdu_vectored`] shares bundle data in
+/// the [`PduSlices`] it fills rather than copying it.  The sender
+/// releases a bundle's buffers once its last bytes are packed, or when it
+/// is cancelled; a [`PduSlices`] holds those it shares until it is
+/// refilled, cleared, or dropped.  The one other copy
 /// joins a bundle that fits one PDU but was pushed in more than one chunk
 /// into a single buffer, when its last chunk is pushed.
 ///
@@ -131,37 +143,239 @@ enum Unsegmented {
 /// # Concurrency
 ///
 /// `Sender` is single-owner: it is mutated through `&mut self`, and the
-/// `tower` impls follow suit.  Under the `tower` feature,
-/// `Service::poll_ready` parks the caller while the transfer window is
-/// saturated or the send queue is at its [`SendQueueHighWatermark`]; the window gate
-/// applies to unsegmented bundles too, since `poll_ready` cannot see the
-/// request.  Every parked task is woken when `Stream::poll_next` drains a
-/// PDU or [`Self::cancel`] frees a slot or queued bytes.  `poll_next`
-/// parks while nothing is ready to pack and never yields `Ready(None)`.
-/// Only the drain frees a full window or a queue at its high watermark, so run producers and the
-/// drain from separate tasks, or from one task that selects over both; a
-/// task that awaits `ready()` before polling the drain stops for good once
-/// the window fills.
+/// `tower` impls follow suit.
+///
+/// A bundle is admitted, whether through [`Self::enqueue`] or
+/// [`Self::begin`], on two checks: [`Self::is_window_available`] and not
+/// [`Self::is_send_queue_high`].  The watermark alone is not enough, since
+/// a segmented bundle refused by the window fails with `WindowFull`.
+/// [`Self::poll_admit`] makes both checks and parks the caller until they
+/// hold; the `tower` `Service::poll_ready` is that gate.  Each push of a
+/// bundle already begun is gated on [`Self::is_push_ready`] instead, and
+/// [`Self::poll_push_ready`] parks it.
+///
+/// Checking the window first holds back a bundle that fits one PDU,
+/// although it takes no transfer number.  A producer that would rather send
+/// it checks only the watermark, calls `enqueue` or `begin`, and treats
+/// `WindowFull` as the refusal: the error leaves the sender as it was, so
+/// the producer parks in `poll_admit`, or holds the bundle until the drain
+/// has run, and tries again.  `poll_admit` wakes a task parked while the
+/// queue was at its watermark once the queue drains, whatever the window's
+/// state, so a full window does not hold such a producer back.
+///
+/// The try belongs in the same poll as `poll_admit`.  A task that awaits
+/// `poll_admit` until it is `Ready` and only then calls `enqueue` is woken
+/// when the queue drains, as it should be, but polls `poll_admit` again,
+/// finds the window still full, and parks on the window: the wake is
+/// spent, and a bundle `enqueue` would have taken waits for the slowest
+/// open transfer.  So an async producer tries on every poll and parks only
+/// on a refusal, and a wrapper over `poll_admit` does the same:
+///
+/// ```
+/// use std::{
+///     future::poll_fn,
+///     pin::pin,
+///     sync::Mutex,
+///     task::{Context, Poll, Waker},
+/// };
+///
+/// use bytes::Bytes;
+/// use hardy_btpu::{
+///     sender::{
+///         Error, PduSize, SendId, SendOptions, SendQueueHighWatermark, Sender, SenderConfig,
+///     },
+///     transfer::WindowSize,
+/// };
+///
+/// async fn admit(sender: &Mutex<Sender>, bundle: Bytes) -> Result<SendId, Error> {
+///     poll_fn(|cx| {
+///         // One lock hold for the try and the park: admission is not
+///         // reserved between them.
+///         let mut sender = sender.lock().unwrap();
+///         if !sender.is_send_queue_high() {
+///             match sender.enqueue(bundle.clone(), SendOptions::default()) {
+///                 // Only a segmented bundle is refused, and the refusal
+///                 // changes nothing.
+///                 Err(Error::WindowFull { .. }) => {}
+///                 result => return Poll::Ready(result),
+///             }
+///         }
+///         // Refused on the watermark or the window, so this is `Pending`
+///         // and wakes the task once the one that refused has room.
+///         let _ = sender.poll_admit(cx);
+///         Poll::Pending
+///     })
+///     .await
+/// }
+///
+/// // A window filled by streamed bundles with nothing pushed, and a queue
+/// // at its watermark.
+/// let mut sender = Sender::new(
+///     SenderConfig {
+///         pdu_size: PduSize::try_from(64).unwrap(),
+///         window_size: WindowSize::try_from(4).unwrap(),
+///         send_queue_high_watermark: SendQueueHighWatermark::try_from(100).unwrap(),
+///         ..SenderConfig::default()
+///     },
+///     0,
+/// );
+/// let _slow: Vec<_> = (0..4)
+///     .map(|_| sender.begin(1000, SendOptions::default()).unwrap())
+///     .collect();
+/// for _ in 0..3 {
+///     sender
+///         .enqueue(Bytes::from(vec![0x9F; 40]), SendOptions::default())
+///         .unwrap();
+/// }
+/// assert!(sender.is_send_queue_high() && !sender.is_window_available());
+/// let sender = Mutex::new(sender);
+///
+/// let mut cx = Context::from_waker(Waker::noop());
+/// let mut admitted = pin!(admit(&sender, Bytes::from(vec![0x9F; 10])));
+/// assert!(admitted.as_mut().poll(&mut cx).is_pending());
+///
+/// // The drain lowers the queue.  The window is still full, and the bundle,
+/// // which fits one PDU, is admitted on the next poll.
+/// while sender.lock().unwrap().next_pdu().is_some() {}
+/// assert!(!sender.lock().unwrap().is_window_available());
+/// assert!(matches!(admitted.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+/// ```
+///
+/// The drain is [`Self::poll_next_pdu_into`],
+/// [`Self::poll_next_pdu_write`], or [`Self::poll_next_pdu_vectored`] (the
+/// `tower` `Stream` under that feature), which parks while nothing is ready
+/// to pack; the `tower` `Stream` never yields `Ready(None)`.  A drain that
+/// must hold room below before it packs, such as a frame permit or a ring
+/// slot, waits in [`Self::poll_pdu_ready`] first, which parks the same way
+/// and packs nothing.  A task parked in `poll_admit` or `poll_push_ready`
+/// is woken when the drain packs a PDU or [`Self::cancel`] frees what it
+/// waits for.  Only the drain frees a full window or a queue at its high
+/// watermark, so run producers and the drain from separate tasks, or from
+/// one task that selects over both; a task that awaits admission before
+/// polling the drain stops for good once the window fills.
 ///
 /// Several producers may share a `Sender` through `Arc<Mutex<_>>`.
-/// Admission is not reserved between `poll_ready` and `call` (or between
-/// [`Self::is_window_available`] and [`Self::enqueue`]), so a producer
-/// takes the lock, polls, and if ready calls before releasing it; and it
-/// releases the lock before parking, so the drain can take it.  A
-/// `WindowFull` from `enqueue` after a positive check means another
-/// producer got there first; check again.  The drain has one consumer.  Do
+/// Admission is not reserved between the checks (or `poll_admit`, or
+/// `poll_ready`) and [`Self::enqueue`] or [`Self::begin`] (or `call`), so
+/// a producer takes the lock, checks, and if admitted calls before
+/// releasing it; and it releases the lock before parking, so the drain can
+/// take it.  A `WindowFull` after a positive check means another producer
+/// got there first; check again.  The drain has one consumer.  Do
 /// **not** use `tower::buffer::Buffer`: it moves the `Sender` into a worker
 /// task and exposes only the `Service` half, so the drain and
-/// [`Self::cancel`] become unreachable, PDUs never leave, and window slots
-/// never free.
+/// [`Self::cancel`] become unreachable, PDUs never leave, and the window
+/// never opens.
+///
+/// ## Without an executor
+///
+/// The wakers are the caller's own (`core::task::Waker`), so a caller with
+/// no executor can still park both sides.  A drain on an OS thread passes a
+/// waker that unparks the thread.  An event loop, or firmware with a main
+/// loop, gives each side a waker that marks it ready in a set the loop
+/// owns, polls a side only once it is marked, and sleeps when nothing is;
+/// the sender then sits in the loop as a socket does in `select`.  For a
+/// loop that sleeps in `epoll_wait`, the waker also writes an eventfd (or
+/// calls a `mio::Waker`) registered with the loop's other sources.  A waker
+/// is used once, so the loop polls a marked side until it is parked again:
+/// the drain until it returns `Pending`, a producer until it is admitted
+/// or `poll_admit` returns `Pending`, and a push until `poll_push_ready`
+/// does.
+///
+/// ```
+/// use std::{
+///     collections::VecDeque,
+///     sync::{
+///         Arc,
+///         atomic::{AtomicU32, Ordering},
+///     },
+///     task::{Context, Poll, Wake, Waker},
+/// };
+///
+/// use bytes::Bytes;
+/// use hardy_btpu::sender::{CarriedList, Error, SendOptions, Sender, SenderConfig};
+///
+/// // The loop's ready set: one bit per side, set by that side's waker.
+/// struct ReadySet(AtomicU32);
+///
+/// struct Mark {
+///     set: Arc<ReadySet>,
+///     bit: u32,
+/// }
+///
+/// impl Wake for Mark {
+///     fn wake(self: Arc<Self>) {
+///         self.set.0.fetch_or(self.bit, Ordering::Release);
+///         // A loop that sleeps in `epoll_wait` also writes its eventfd here.
+///     }
+/// }
+///
+/// const ADMIT: u32 = 1 << 0;
+/// const DRAIN: u32 = 1 << 1;
+///
+/// let mut sender = Sender::new(SenderConfig::default(), 0);
+/// let set = Arc::new(ReadySet(AtomicU32::new(ADMIT | DRAIN)));
+/// let mark = |bit| Waker::from(Arc::new(Mark { set: set.clone(), bit }));
+/// let (admit, drain) = (mark(ADMIT), mark(DRAIN));
+///
+/// // Bundles from the BPA: more segmented ones than the window holds, and
+/// // some that fit one PDU.
+/// let mut waiting: VecDeque<Bytes> = (0..40)
+///     .map(|i| Bytes::from(vec![0x9F; if i % 4 == 0 { 100 } else { 4000 }]))
+///     .collect();
+/// let mut carried = CarriedList::new();
+/// let mut slot = vec![0; 1500];
+/// let mut completed = 0;
+///
+/// loop {
+///     let ready = set.0.swap(0, Ordering::Acquire);
+///     if ready == 0 {
+///         // A real loop sleeps here (`epoll_wait`, WFI) until a waker or
+///         // another source, such as the BPA, wakes it.  This one has no
+///         // other source, so nothing is left to do.
+///         break;
+///     }
+///     if ready & ADMIT != 0 {
+///         while let Some(bundle) = waiting.front() {
+///             // Below the watermark, try: only a segmented bundle can be
+///             // refused, and the refusal changes nothing.
+///             let admitted = !sender.is_send_queue_high()
+///                 && match sender.enqueue(bundle.clone(), SendOptions::default()) {
+///                     Ok(_) => true,
+///                     Err(Error::WindowFull { .. }) => false,
+///                     Err(e) => return Err(e),
+///                 };
+///             if !admitted {
+///                 // Refused on the window or the watermark, so this is
+///                 // `Pending` and marks ADMIT once the one that refused
+///                 // has room.
+///                 let _ = sender.poll_admit(&mut Context::from_waker(&admit));
+///                 break;
+///             }
+///             waiting.pop_front();
+///         }
+///     }
+///     if ready & DRAIN != 0 {
+///         let mut cx = Context::from_waker(&drain);
+///         while let Poll::Ready(len) =
+///             sender.poll_next_pdu_write(&mut cx, &mut carried, &mut slot)
+///         {
+///             let pdu = &slot[..len?]; // to the link
+///             completed += carried.completed().count();
+///         }
+///     }
+/// }
+/// assert!(waiting.is_empty());
+/// assert_eq!(completed, 40);
+/// # Ok::<(), Error>(())
+/// ```
 pub struct Sender {
     /// Stamped on every [`SendId`] this sender issues, so that an ID or
     /// handle from another sender is refused rather than taken for a
     /// bundle of this one's under the same local ID.
     owner: Owner,
     pdu_size: PduSize,
-    /// Backpressure threshold on `queued_bytes`; enforced by the `tower`
-    /// `Service::poll_ready` rather than by `enqueue` or `push` themselves.
+    /// Backpressure threshold on `queued_bytes`; enforced by
+    /// [`Self::poll_admit`] rather than by `enqueue` or `push` themselves.
     send_queue_high_watermark: SendQueueHighWatermark,
     /// The bundle bytes held in the queue and in `assembling`.  A `u64`, so
     /// that clones of one buffer queued many times cannot wrap it on a
@@ -195,19 +409,43 @@ pub struct Sender {
     /// The counter value for the next [`SendKind::Message`] or
     /// [`SendKind::Bare`]; wraps.
     next_bundle_id: u32,
-    /// Every task parked in the `tower` `Service::poll_ready`, woken when a
-    /// window slot frees or the send queue drains below its high watermark.  A list
-    /// rather than a slot so that several producers sharing the sender
-    /// through a mutex are all woken; re-registration by a task already
-    /// present is deduplicated with `Waker::will_wake`.
-    #[cfg(feature = "tower")]
-    enqueue_wakers: Vec<Waker>,
-    /// The task parked in `Stream::poll_next`, woken when a bundle joins
-    /// `order` (through [`Self::queue`]), a Transfer Cancel is queued, or a
-    /// push lets a queued transfer open a PDU.  Single-slot: the drain has
-    /// one consumer.
-    #[cfg(feature = "tower")]
+    /// The tasks that parked in [`Self::poll_admit`] while the send queue
+    /// was at its high watermark, woken once it drains below it whatever
+    /// the window's state, since a bundle that fits one PDU is then
+    /// admitted.  A list rather than a slot so that several producers
+    /// sharing the sender through a mutex are all woken; re-registration
+    /// by a task already present is deduplicated with `Waker::will_wake`.
+    /// Empty whenever the queue is below its watermark.
+    watermark_wakers: Vec<Waker>,
+    /// The tasks that parked in [`Self::poll_admit`] while the send queue
+    /// was below its high watermark, and so on the window, woken once
+    /// [`Self::is_admissible`] holds.  A task is in this list or
+    /// `watermark_wakers`, not both.
+    window_wakers: Vec<Waker>,
+    /// The tasks parked in [`Self::poll_push_ready`], one per transfer,
+    /// keyed by transfer number.  A task is woken once
+    /// [`Self::is_push_ready`] holds for its bundle, checked after every
+    /// PDU packed and every cancel.
+    push_wakers: Vec<(u32, Waker)>,
+    /// The task parked on the drain (`poll_pdu_ready`,
+    /// `poll_next_pdu_into`, `poll_next_pdu_write`,
+    /// `poll_next_pdu_vectored`, or the `tower` `Stream`), woken when a
+    /// bundle joins `order` (through [`Self::queue`]), a Transfer Cancel is
+    /// queued, or a push lets a queued transfer open a PDU.  Single-slot:
+    /// the drain has one consumer.
     drain_waker: Option<Waker>,
+    /// What packing the last PDU learned of the queue, kept so the next
+    /// PDU reuses its buffer (see [`Self::ready`]).
+    scan: Scan,
+    /// What the sender has done since it was created.
+    stats: SenderStats,
+    /// PDU buffers allocated: one for each PDU packed by `next_pdu` or
+    /// `next_pdu_into`, and none for a call that finds nothing to pack,
+    /// for a bare bundle frame, which is its own buffer, or for a PDU
+    /// packed into memory the caller supplies.  Not one of the
+    /// [`SenderStats`]: it tells which output the caller chose, not what
+    /// the sender sent.
+    pdu_buffers_allocated: u64,
     /// The queue entries examined by packing, summed over every PDU.
     #[cfg(test)]
     probes: usize,
@@ -217,24 +455,36 @@ pub struct Sender {
 /// bytes would make the output as large as the backlog.
 impl fmt::Debug for Sender {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut d = f.debug_struct("Sender");
-        d.field("pdu_size", &self.pdu_size)
+        let stats = self.stats();
+        f.debug_struct("Sender")
+            .field("pdu_size", &self.pdu_size)
             .field("send_queue_high_watermark", &self.send_queue_high_watermark)
             .field("link_framing", &self.link_framing)
             .field("segment_cut_strategy", &self.segment_cut_strategy)
             .field("window_size", &self.allocator.window_size())
-            .field("transfers_outstanding", &self.allocator.in_progress())
+            .field("transfers_outstanding", &self.transfers_outstanding())
             .field("window_available", &self.is_window_available())
             .field("queued", &(self.order.len() + self.parked.len()))
             .field("parked", &self.parked.len())
             .field("cancels", &self.cancels.len())
             .field("queued_bytes", &self.queued_bytes)
             .field("assembling", &self.assembling.len())
-            .field("next_bundle_id", &self.next_bundle_id);
-        #[cfg(feature = "tower")]
-        d.field("enqueue_wakers", &self.enqueue_wakers.len())
-            .field("drain_waker", &self.drain_waker.is_some());
-        d.finish()
+            .field("next_bundle_id", &self.next_bundle_id)
+            .field("watermark_wakers", &self.watermark_wakers.len())
+            .field("window_wakers", &self.window_wakers.len())
+            .field("push_wakers", &self.push_wakers.len())
+            .field("drain_waker", &self.drain_waker.is_some())
+            .field("pdu_buffers_allocated", &self.pdu_buffers_allocated)
+            .field("pdus_packed", &stats.pdus_packed())
+            .field("pdu_bytes_packed", &stats.pdu_bytes_packed())
+            .field("bundle_bytes_packed", &stats.bundle_bytes_packed())
+            .field("padding_bytes_packed", &stats.padding_bytes_packed())
+            .field("segments_packed", &stats.segments_packed())
+            .field("flush_segments_packed", &stats.flush_segments_packed())
+            .field("transfers_allocated", &stats.transfers_allocated())
+            .field("bundles_cancelled", &stats.bundles_cancelled())
+            .field("transfer_cancels_queued", &stats.transfer_cancels_queued())
+            .finish()
     }
 }
 
@@ -263,10 +513,13 @@ impl Sender {
             cancels: VecDeque::new(),
             assembling: BTreeMap::new(),
             next_bundle_id: 0,
-            #[cfg(feature = "tower")]
-            enqueue_wakers: Vec::new(),
-            #[cfg(feature = "tower")]
+            watermark_wakers: Vec::new(),
+            window_wakers: Vec::new(),
+            push_wakers: Vec::new(),
             drain_waker: None,
+            scan: Scan::default(),
+            stats: SenderStats::default(),
+            pdu_buffers_allocated: 0,
             #[cfg(test)]
             probes: 0,
         }
@@ -326,6 +579,7 @@ impl Sender {
     /// every bundle, and wake the drain.
     fn queue_cancel(&mut self, transfer_number: u32) {
         self.cancels.push_back(transfer_number);
+        self.stats.transfer_cancel_queued();
         self.wake_drain();
     }
 
@@ -404,39 +658,67 @@ impl Sender {
         })
     }
 
-    /// Wake every task parked on a `Service::poll_ready` that returned
-    /// `Pending` because the window was full or the send queue was at its
-    /// high watermark, once both have room: the same predicate `poll_ready` gates
-    /// on, so a woken task finds the service ready.  No-op without the
-    /// `tower` feature.
-    #[cfg(feature = "tower")]
-    fn wake_enqueue(&mut self) {
-        if self.is_window_available() && !self.is_send_queue_high() {
-            for w in self.enqueue_wakers.drain(..) {
+    /// The sender's running totals since it was created (see
+    /// [`SenderStats`]).
+    pub(crate) fn stats(&self) -> SenderStats {
+        self.stats
+    }
+
+    /// The segmented bundles in progress: those admitted whose Transfer End
+    /// is not yet packed and that have not been cancelled.  Each holds a
+    /// transfer number.
+    ///
+    /// This is a count, and the window is a span: [`Self::enqueue`] and
+    /// [`Self::begin`] can refuse a segmented bundle with fewer transfers
+    /// in progress than the window size, when the oldest of them is a
+    /// window behind the next number.  [`Self::is_window_available`] is
+    /// the gate.
+    pub(crate) fn transfers_outstanding(&self) -> usize {
+        self.allocator.in_progress()
+    }
+
+    /// Wake every parked producer whose gate now holds, asking each gate's
+    /// own predicate, so a woken task finds itself ready and no task is
+    /// left parked once it is.  Called after every change that can open a
+    /// gate: packing a PDU and cancelling a bundle.
+    fn wake_producers(&mut self) {
+        let mut i = 0;
+        while let Some(&(transfer_number, _)) = self.push_wakers.get(i) {
+            if self.is_transfer_push_ready(transfer_number) {
+                self.push_wakers.swap_remove(i).1.wake();
+            } else {
+                i += 1;
+            }
+        }
+        // Each predicate is asked only if a task waits on it: this runs
+        // for every PDU packed, most often with nothing parked.
+        if !self.watermark_wakers.is_empty() && !self.is_send_queue_high() {
+            for w in self.watermark_wakers.drain(..) {
+                w.wake();
+            }
+        }
+        if !self.window_wakers.is_empty() && self.is_admissible() {
+            for w in self.window_wakers.drain(..) {
                 w.wake();
             }
         }
     }
-    #[cfg(not(feature = "tower"))]
-    fn wake_enqueue(&mut self) {}
 
-    /// Wake any task parked on a `Stream::poll_next` that returned `Pending`
-    /// because nothing was ready. No-op without the `tower` feature.
-    #[cfg(feature = "tower")]
+    /// Wake the task parked on the drain, if any.
     fn wake_drain(&mut self) {
         if let Some(w) = self.drain_waker.take() {
             w.wake();
         }
     }
-    #[cfg(not(feature = "tower"))]
-    fn wake_drain(&mut self) {}
 
     /// Whether a segmented bundle could currently be admitted without
     /// violating the transfer window: whether its transfer number would keep
     /// the oldest outstanding transfer inside the window.
     ///
-    /// The `tower` `Service::poll_ready` uses this as its window gate, so it
-    /// is exactly the predicate [`Self::enqueue`] applies when segmenting.
+    /// [`Self::poll_admit`] uses this as its window gate, so it is exactly
+    /// the predicate [`Self::enqueue`] and [`Self::begin`] apply when
+    /// segmenting.  Gate both on it together with
+    /// [`Self::is_send_queue_high`].
     pub fn is_window_available(&self) -> bool {
         self.allocator.can_allocate()
     }
@@ -444,19 +726,20 @@ impl Sender {
     /// Whether the bytes queued and not yet packed have reached the
     /// configured [`SendQueueHighWatermark`].
     ///
-    /// The `tower` `Service::poll_ready` uses this as its admission gate:
-    /// unsegmented bundles take no window slot, so without it the queue
+    /// [`Self::poll_admit`] uses this as an admission gate:
+    /// unsegmented bundles take no transfer number, so without it the queue
     /// would grow without bound whenever the drain side is slower.  Direct
     /// [`Self::enqueue`] and [`Self::push`] callers can poll it to pace
     /// themselves the same way, draining [`Self::next_pdu`] when it reports
     /// full.
     ///
-    /// Gate [`Self::begin`] and [`Self::enqueue`] on it, and each push of a
-    /// bundle already begun on [`Self::is_push_ready`].  A segment goes out
-    /// only once its bytes are pushed (see [`SegmentCutStrategy`]), so when
-    /// every bundle in the queue is waiting on its producer, only pushes can
-    /// free it; a producer that waits here mid-bundle can then wait on
-    /// bytes only it would supply.
+    /// Gate [`Self::begin`] and [`Self::enqueue`] on it together with
+    /// [`Self::is_window_available`], and each push of a bundle already
+    /// begun on [`Self::is_push_ready`].  A segment goes out only once its
+    /// bytes are pushed (see [`SegmentCutStrategy`]), so when every bundle
+    /// in the queue is waiting on its producer, only pushes can free it; a
+    /// producer that waits here mid-bundle can then wait on bytes only it
+    /// would supply.
     pub fn is_send_queue_high(&self) -> bool {
         self.queued_bytes >= self.send_queue_high_watermark.get() as u64
     }
@@ -469,32 +752,66 @@ impl Sender {
     /// while the bundle cannot open a PDU without more bytes: a segmented
     /// bundle whose next segment is waiting on its producer, though it may
     /// still fill the tail of a PDU another entry opened, or a bundle that
-    /// fits one PDU and is not yet fully pushed.  A producer that waits only when
-    /// this is false therefore never waits on bytes only it would supply.
-    /// A bundle holds less than one segment (or one PDU) when a push past
-    /// the watermark is admitted for it, so the queue exceeds its watermark
-    /// by less than one segment and one chunk per bundle in progress, a
-    /// chunk being whatever size the producer pushes.
+    /// fits one PDU and is not yet fully pushed.  A producer that waits
+    /// only when this is false therefore never waits on bytes only it would
+    /// supply.  A bundle holds less than one segment (or one PDU) when a
+    /// push past the watermark is admitted for it, so the queue exceeds its
+    /// watermark by less than one segment and one chunk per bundle in
+    /// progress, a chunk being whatever size the producer pushes.
     ///
     /// Also true for a handle whose bundle is not in progress, or that
-    /// another sender issued, so that [`Self::push`] reports why.  Nothing
-    /// wakes a producer when this turns true; it is checked again after
-    /// draining.
+    /// another sender issued, so that [`Self::push`] reports why.
+    /// [`Self::poll_push_ready`] parks a producer until it is true.
     ///
     /// Costs a scan of the send queue for a segmented bundle while the
     /// queue is at its high watermark.
     pub fn is_push_ready(&self, handle: &SendHandle) -> bool {
-        if !self.is_send_queue_high() {
-            return true;
+        match handle.id.local {
+            LocalId::Transfer(transfer_number) if handle.id.owner == self.owner => {
+                self.is_transfer_push_ready(transfer_number)
+            }
+            _ => true,
         }
-        let LocalId::Transfer(transfer_number) = handle.id.local else {
-            return true;
+    }
+
+    /// [`Self::is_push_ready`] for this sender's transfer numbered
+    /// `transfer_number`.
+    fn is_transfer_push_ready(&self, transfer_number: u32) -> bool {
+        !self.is_send_queue_high()
+            || self
+                .find_transfer(transfer_number)
+                .is_none_or(|t| t.waiting(self.pdu_size.get()))
+    }
+
+    /// Check [`Self::is_push_ready`], and if it is false, park the caller
+    /// until it may have become true.
+    ///
+    /// The task is woken when the drain packs the bundle's buffered bytes
+    /// so that its next segment waits on the producer, when the bundle's
+    /// transfer number is released (its End packed, or the bundle
+    /// cancelled), or when the send queue drains below its high watermark.
+    /// One task parks per bundle: polling again from another task replaces
+    /// the first.
+    pub fn poll_push_ready(&mut self, handle: &SendHandle, cx: &mut Context<'_>) -> Poll<()> {
+        // As `is_push_ready`: true for every handle but one of this
+        // sender's segmented bundles.
+        let transfer_number = match handle.id.local {
+            LocalId::Transfer(n) if handle.id.owner == self.owner => n,
+            _ => return Poll::Ready(()),
         };
-        if handle.id.owner != self.owner {
-            return true;
+        if self.is_transfer_push_ready(transfer_number) {
+            return Poll::Ready(());
         }
-        self.find_transfer(transfer_number)
-            .is_none_or(|t| t.waiting(self.pdu_size.get()))
+        let waker = cx.waker();
+        match self
+            .push_wakers
+            .iter_mut()
+            .find(|(n, _)| *n == transfer_number)
+        {
+            Some((_, w)) => w.clone_from(waker),
+            None => self.push_wakers.push((transfer_number, waker.clone())),
+        }
+        Poll::Pending
     }
 
     /// The bundle bytes queued and not yet packed into a PDU, as
@@ -511,28 +828,72 @@ impl Sender {
             .ok_or(Error::QueuedBytesOverflow)
     }
 
-    /// Register a task to be woken when a window slot frees or the send
-    /// queue drains.  Used by the `tower` Service impl from `poll_ready`.
-    /// Costs a scan of the tasks already parked, to skip one that is.
+    /// Whether a bundle may be admitted through [`Self::enqueue`] or
+    /// [`Self::begin`]: `Ready` while [`Self::is_window_available`] and the
+    /// send queue is below its high watermark, and otherwise `Pending`,
+    /// with the task registered to be woken.
     ///
-    /// Deduplication relies on `Waker::will_wake`.  An executor that polls
-    /// a pending task again without waking it, with a waker that is not
-    /// `will_wake`-equal to the last, would add one entry per such poll
-    /// until the next wake clears the list; polling without a wake breaks
-    /// the executor contract, and one task's wakers compare equal in the
-    /// common executors, so the list stays one entry per producer.
-    #[cfg(feature = "tower")]
-    pub(crate) fn register_enqueue_waker(&mut self, waker: &Waker) {
-        if !self.enqueue_wakers.iter().any(|w| w.will_wake(waker)) {
-            self.enqueue_wakers.push(waker.clone());
+    /// A task that parks while the queue is at its watermark is woken once
+    /// the queue drains below it, and one that parks on the window alone
+    /// once both hold.  The first may find the window still full: a bundle
+    /// that fits one PDU is admitted then (see the Concurrency section on
+    /// [`Sender`]), and a caller that needs the window polls again, which
+    /// parks it on the window.  A caller woken that way must therefore try
+    /// `enqueue` or `begin` before it polls here again: one that awaits
+    /// this call until `Ready` and only then tries spends the wake and
+    /// holds a bundle that fits behind the full window.
+    ///
+    /// The window gate applies to a bundle that fits one PDU too, which
+    /// takes no transfer number, since the request is not seen.  Admission
+    /// is not reserved: call `enqueue` or `begin` before giving up the
+    /// sender (see the Concurrency section on [`Sender`]).  A pending task
+    /// is woken when a drain packs a PDU or [`Self::cancel`] opens the
+    /// window or frees queued bytes, so it must not be the task that
+    /// drains.  The `tower` `Service::poll_ready` is this gate.
+    ///
+    /// Every pending caller is registered, so several producers sharing the
+    /// sender are all woken.  A task polling again is registered once,
+    /// deduplicated by `Waker::will_wake` at the cost of a scan of the
+    /// tasks already parked.  An executor that polls a pending task again
+    /// without waking it, with a waker that is not `will_wake`-equal to
+    /// the last, would add one entry per such poll until the next wake
+    /// clears the list; polling without a wake breaks the executor
+    /// contract, and one task's wakers compare equal in the common
+    /// executors, so the list stays one entry per producer.  A task
+    /// dropped while parked is not removed: its waker stays registered
+    /// until the gate it parked on opens, and is then woken to no effect.
+    pub fn poll_admit(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.is_admissible() {
+            return Poll::Ready(());
         }
+        let waker = cx.waker();
+        // The gate closed now decides what wakes the task.  A task polled
+        // again may have parked on the other gate, so it leaves that list.
+        let (parked, other) = if self.is_send_queue_high() {
+            (&mut self.watermark_wakers, &mut self.window_wakers)
+        } else {
+            (&mut self.window_wakers, &mut self.watermark_wakers)
+        };
+        other.retain(|w| !w.will_wake(waker));
+        if !parked.iter().any(|w| w.will_wake(waker)) {
+            parked.push(waker.clone());
+        }
+        Poll::Pending
     }
 
-    /// Register a waker to be notified when a new PDU becomes available.
-    /// Used by the `tower` Stream impl from `poll_next`.
-    #[cfg(feature = "tower")]
-    pub(crate) fn register_drain_waker(&mut self, waker: Waker) {
-        self.drain_waker = Some(waker);
+    /// The predicate [`Self::poll_admit`] gates on: the window and the send
+    /// queue both have room.
+    fn is_admissible(&self) -> bool {
+        self.is_window_available() && !self.is_send_queue_high()
+    }
+
+    /// Register `cx`'s task to be woken when there may be a PDU to pack,
+    /// replacing any task registered before: the drain has one consumer.
+    fn register_drain_waker(&mut self, cx: &Context<'_>) {
+        match &mut self.drain_waker {
+            Some(w) => w.clone_from(cx.waker()),
+            slot => *slot = Some(cx.waker().clone()),
+        }
     }
 
     /// Queue a bundle for transmission, returning the ID under which
@@ -555,12 +916,16 @@ impl Sender {
     /// An empty `data` is rejected with [`Error::Empty`]: it cannot be
     /// a valid bundle (Section 8.1), and nothing is queued.  So is a
     /// bundle whose bytes would overflow [`Self::queued_bytes`]
-    /// ([`Error::QueuedBytesOverflow`]).
+    /// ([`Error::QueuedBytesOverflow`]), and a segmented bundle while the
+    /// window has no room for its transfer number ([`Error::WindowFull`]),
+    /// which leaves the sender as it was, so the bundle can be offered again
+    /// once the window opens.
     ///
-    /// Segments are copied out of `data` into the PDUs that carry them,
-    /// and `data` is released as its last segment is packed; until then it
-    /// keeps alive any larger allocation it is a view into (see
-    /// [Memory](Self#memory)).
+    /// Segments are copied out of `data` into the PDUs that carry them, or
+    /// shared with the [`PduSlices`] that [`Self::next_pdu_vectored`]
+    /// fills, and the sender releases `data` as its last segment is packed.
+    /// While the sender or a [`PduSlices`] holds `data`, it keeps alive any
+    /// larger allocation it is a view into (see [Memory](Self#memory)).
     pub fn enqueue(&mut self, data: Bytes, options: SendOptions) -> Result<SendId> {
         let bare_ok = frame_kind(&data) != FrameKind::BtpuPdu;
         let len = data.len();
@@ -586,9 +951,16 @@ impl Sender {
     ///
     /// The bundle is framed as [`Self::enqueue`] would frame `total_len`
     /// bytes with these `options`, and is refused for the same reasons
-    /// before anything is queued; a segmented bundle takes its window slot
-    /// here.  Under [`BundleFraming::Bare`], `begin` cannot see the first
-    /// byte, so a fitting bundle without caller hints is begun as a
+    /// before anything is queued; a segmented bundle takes its transfer
+    /// number here, so `begin` is admitted as `enqueue` is (see the
+    /// Concurrency section on [`Sender`]).  The window bounds the span from
+    /// the oldest outstanding transfer number, not how many are in
+    /// progress, so a transfer slow to finish can hold back a `begin` while
+    /// fewer than `window_size` bundles are in progress.  A `WindowFull`
+    /// leaves the sender as it was.
+    ///
+    /// Under [`BundleFraming::Bare`], `begin` cannot see the first byte, so
+    /// a fitting bundle without caller hints is begun as a
     /// [`SendKind::Bare`] and its first chunk must start with a
     /// bundle-reserved byte (see [`Error::NotABundle`]).
     ///
@@ -632,12 +1004,13 @@ impl Sender {
     ///
     /// # Errors
     ///
-    /// Nothing is pushed if the chunk would take the bundle past its
-    /// length ([`Error::Overrun`]), the bundle has been cancelled
-    /// ([`Error::NotInProgress`]), the first chunk of a bare bundle frame is
-    /// not a bundle ([`Error::NotABundle`]), `handle` is another sender's
-    /// ([`Error::ForeignHandle`]), or the chunk's bytes would overflow
-    /// [`Self::queued_bytes`] ([`Error::QueuedBytesOverflow`]).  The bundle stays as it was in each case.
+    /// Nothing is pushed if the chunk would take the bundle past its length
+    /// ([`Error::Overrun`]), the bundle has been cancelled
+    /// ([`Error::NotInProgress`]), the first chunk of a bare bundle frame
+    /// is not a bundle ([`Error::NotABundle`]), `handle` is another
+    /// sender's ([`Error::ForeignHandle`]), or the chunk's bytes would
+    /// overflow [`Self::queued_bytes`] ([`Error::QueuedBytesOverflow`]).
+    /// The bundle stays as it was in each case.
     pub fn push(&mut self, handle: &mut SendHandle, chunk: Bytes) -> Result<()> {
         if handle.id.owner != self.owner {
             return Err(Error::ForeignHandle);
@@ -722,7 +1095,7 @@ impl Sender {
     }
 
     /// Decide how a bundle of `total_len` bytes is framed, taking its ID
-    /// and, if it is segmented, its window slot.  `bare_ok` is whether its
+    /// and, if it is segmented, its transfer number.  `bare_ok` is whether its
     /// first byte allows a bare bundle frame.
     fn plan(&mut self, total_len: usize, options: SendOptions, bare_ok: bool) -> Result<Planned> {
         if total_len == 0 {
@@ -792,6 +1165,7 @@ impl Sender {
                 window_size: self.allocator.window_size(),
             });
         };
+        self.stats.transfer_allocated();
         Ok(Planned::Transfer(QueuedTransfer::new(
             transfer_number,
             total_len,
@@ -814,8 +1188,8 @@ impl Sender {
 
     /// Abandon a bundle the sender has not finished emitting.
     ///
-    /// For a [`SendKind::Transfer`], the transfer's window slot is
-    /// freed and its segments not yet packed are discarded.  If any had
+    /// For a [`SendKind::Transfer`], the transfer's number is released
+    /// and its segments not yet packed are discarded.  If any had
     /// already been emitted, a Transfer Cancel message is queued ahead of
     /// every bundle waiting, behind only the Cancels queued before it, so
     /// the receiver discards what it holds (Section 4.2) as soon as the
@@ -860,9 +1234,11 @@ impl Sender {
             },
         };
         if cancelled {
-            // A window slot or queued bytes freed.  A Transfer Cancel
-            // queued in its place has woken the drain already.
-            self.wake_enqueue();
+            // A transfer number or queued bytes freed, and the bundle's own
+            // push is ready.  A Transfer Cancel queued in its place has
+            // woken the drain already.
+            self.stats.bundle_cancelled();
+            self.wake_producers();
         }
         cancelled
     }
@@ -889,13 +1265,17 @@ impl Sender {
         true
     }
     /// Returns `true` if there are messages pending for transmission.
+    ///
+    /// True also for a transfer waiting on its producer, which supplies
+    /// nothing yet; [`Self::poll_pdu_ready`] tells whether a PDU can be
+    /// packed now.
     pub fn has_pending(&self) -> bool {
         !(self.order.is_empty() && self.parked.is_empty() && self.cancels.is_empty())
     }
 
     /// Whether the sender still has bytes of the bundle `id` names to
     /// emit: what [`Self::cancel`] would act on.  A transfer is outstanding,
-    /// holding its window slot, until its End is packed or it is cancelled;
+    /// holding its transfer number, until its End is packed or it is cancelled;
     /// a Bundle Message or bare frame until it is packed or cancelled.  An
     /// ID from another sender is a bug in the caller: a debug build panics
     /// on it, and a release build returns `false`.
@@ -995,7 +1375,7 @@ impl Sender {
 enum Planned {
     /// A Bundle Message or bare bundle frame, by the ID's variant.
     Whole { id: LocalId, hints: Vec<HintItem> },
-    /// A segmented bundle, its window slot taken.
+    /// A segmented bundle, its transfer number taken.
     Transfer(QueuedTransfer),
 }
 
@@ -1006,7 +1386,269 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::codec::hint::{HintValue, Hints};
+    use crate::codec::{
+        decode_pdu,
+        hint::{HintValue, Hints},
+    };
+
+    const FLUSH: NextPduOptions = NextPduOptions { flush: true };
+
+    // The three ways a PDU leaves the sender, each returning it as `Bytes`.
+    type Drain = fn(&mut Sender, NextPduOptions) -> Option<Bytes>;
+
+    fn drain_into(s: &mut Sender, options: NextPduOptions) -> Option<Bytes> {
+        s.next_pdu_into_with(&mut CarriedList::new(), options)
+    }
+
+    fn drain_write(s: &mut Sender, options: NextPduOptions) -> Option<Bytes> {
+        let mut out = vec![0; s.pdu_size.get()];
+        let len = s
+            .next_pdu_write_with(&mut CarriedList::new(), &mut out, options)
+            .unwrap()?;
+        Some(Bytes::copy_from_slice(&out[..len]))
+    }
+
+    fn drain_vectored(s: &mut Sender, options: NextPduOptions) -> Option<Bytes> {
+        let mut out = PduSlices::default();
+        s.next_pdu_vectored_with(&mut CarriedList::new(), &mut out, options)?;
+        Some(Bytes::from(out.iter().collect::<Vec<_>>().concat()))
+    }
+
+    // Bundle Messages, a transfer cancelled after its first segment, a
+    // whole transfer, and a streamed one with a flushed segment, packed
+    // through `drain` into 64-byte PDUs: the totals and the PDUs.
+    fn mixed_traffic(link_framing: LinkFraming, drain: Drain) -> (SenderStats, Vec<Bytes>) {
+        let mut s = Sender::new(
+            SenderConfig {
+                pdu_size: PduSize::try_from(64).unwrap(),
+                link_framing,
+                ..SenderConfig::default()
+            },
+            0,
+        );
+        let enqueue = |s: &mut Sender, len| {
+            s.enqueue(Bytes::from(vec![0x9F; len]), SendOptions::default())
+                .unwrap()
+        };
+        let mut pdus = Vec::new();
+
+        enqueue(&mut s, 20);
+        enqueue(&mut s, 5);
+        let cancelled = enqueue(&mut s, 200);
+        enqueue(&mut s, 150);
+        // The second PDU opens with the first segment of the 200-byte
+        // bundle.
+        for _ in 0..2 {
+            pdus.push(drain(&mut s, NextPduOptions::default()).unwrap());
+        }
+        assert!(s.cancel(cancelled));
+
+        let mut handle = s.begin(300, SendOptions::default()).unwrap();
+        s.push(&mut handle, Bytes::from(vec![0x9F; 10])).unwrap();
+        pdus.extend(from_fn(|| drain(&mut s, NextPduOptions::default())));
+        // Only the streamed transfer is left, waiting on its producer.
+        pdus.push(drain(&mut s, FLUSH).unwrap());
+        assert_eq!(drain(&mut s, FLUSH), None);
+        s.push(&mut handle, Bytes::from(vec![0x9F; 290])).unwrap();
+        s.finish(handle).unwrap();
+        pdus.extend(from_fn(|| drain(&mut s, NextPduOptions::default())));
+        assert!(!s.has_pending());
+        (s.stats(), pdus)
+    }
+
+    // What the PDUs hold, read back from the wire: their bytes, the bundle
+    // bytes, the padding, and the segments.
+    fn wire_totals(pdus: &[Bytes]) -> (u64, u64, u64, u64) {
+        let (mut pdu_bytes, mut bundle_bytes, mut padding_bytes, mut segments) = (0, 0, 0, 0);
+        for pdu in pdus {
+            pdu_bytes += pdu.len();
+            // Whatever is not a message is padding, the zero bytes of
+            // Indefinite Padding included.
+            padding_bytes += pdu.len();
+            for message in decode_pdu(pdu.clone()) {
+                let message = message.unwrap();
+                match &message {
+                    Message::DefinitePadding { .. } => continue,
+                    Message::Bundle { data, .. } => bundle_bytes += data.len(),
+                    Message::TransferSegment(segment) | Message::TransferEnd(segment) => {
+                        segments += 1;
+                        bundle_bytes += segment.data.len();
+                    }
+                    _ => {}
+                }
+                padding_bytes -= encoded_message_len(&message);
+            }
+        }
+        (
+            pdu_bytes as u64,
+            bundle_bytes as u64,
+            padding_bytes as u64,
+            segments,
+        )
+    }
+
+    #[test]
+    fn stats_match_what_the_pdus_carry_through_every_output() {
+        for link_framing in [
+            LinkFraming::FixedSize,
+            LinkFraming::variable(BundleFraming::Message),
+        ] {
+            let (stats, pdus) = mixed_traffic(link_framing, drain_into);
+            assert_eq!(
+                (
+                    stats.pdu_bytes_packed(),
+                    stats.bundle_bytes_packed(),
+                    stats.padding_bytes_packed(),
+                    stats.segments_packed(),
+                ),
+                wire_totals(&pdus)
+            );
+            assert_eq!(stats.pdus_packed(), pdus.len() as u64);
+            // Every bundle byte once: the cancelled transfer's first
+            // segment, and nothing more of it.
+            assert!(stats.bundle_bytes_packed() > 20 + 5 + 150 + 300);
+            assert!(stats.bundle_bytes_packed() < 20 + 5 + 200 + 150 + 300);
+            assert_eq!(stats.flush_segments_packed(), 1);
+            assert_eq!(stats.transfers_allocated(), 3);
+            assert_eq!(stats.bundles_cancelled(), 1);
+            assert_eq!(stats.transfer_cancels_queued(), 1);
+            // Fixed-size PDUs are padded, and variable ones are not.
+            assert_eq!(
+                stats.padding_bytes_packed() > 0,
+                link_framing == LinkFraming::FixedSize
+            );
+
+            for drain in [drain_write as Drain, drain_vectored] {
+                assert_eq!(mixed_traffic(link_framing, drain), (stats, pdus.clone()));
+            }
+        }
+    }
+
+    #[test]
+    fn stats_count_a_flushed_segment_among_the_segments() {
+        let mut s = Sender::new(
+            SenderConfig {
+                pdu_size: PduSize::try_from(64).unwrap(),
+                ..SenderConfig::default()
+            },
+            0,
+        );
+        let mut handle = s.begin(300, SendOptions::default()).unwrap();
+        s.push(&mut handle, Bytes::from(vec![0x9F; 10])).unwrap();
+        assert_eq!(s.next_pdu(), None);
+        assert_eq!(s.stats().segments_packed(), 0);
+
+        assert_eq!(s.next_pdu_with(FLUSH).map(|pdu| pdu.data.len()), Some(64));
+        let flushed = s.stats();
+        assert_eq!(flushed.segments_packed(), 1);
+        assert_eq!(flushed.flush_segments_packed(), 1);
+        assert_eq!(flushed.bundle_bytes_packed(), 10);
+        assert_eq!(flushed.pdu_bytes_packed(), 64);
+
+        // The rest goes out as the cut strategy cuts it, flush or no.
+        s.push(&mut handle, Bytes::from(vec![0x9F; 290])).unwrap();
+        s.finish(handle).unwrap();
+        let pdus = from_fn(|| s.next_pdu_with(FLUSH)).count() as u64;
+        let stats = s.stats();
+        assert_eq!(stats.segments_packed(), 1 + pdus);
+        assert_eq!(stats.flush_segments_packed(), 1);
+        assert_eq!(stats.bundle_bytes_packed(), 300);
+        assert_eq!(stats.pdus_packed(), 1 + pdus);
+    }
+
+    #[test]
+    fn stats_count_a_bare_frame_as_bundle_bytes_and_no_padding() {
+        let mut s = Sender::new(
+            SenderConfig {
+                link_framing: LinkFraming::variable(BundleFraming::Bare),
+                ..SenderConfig::default()
+            },
+            0,
+        );
+        let id = s
+            .enqueue(Bytes::from(vec![0x9F; 100]), SendOptions::default())
+            .unwrap();
+        assert_eq!(id.kind(), SendKind::Bare);
+        assert_eq!(s.next_pdu().map(|pdu| pdu.data.len()), Some(100));
+        let stats = s.stats();
+        assert_eq!(stats.pdus_packed(), 1);
+        assert_eq!(stats.pdu_bytes_packed(), 100);
+        assert_eq!(stats.bundle_bytes_packed(), 100);
+        assert_eq!(stats.padding_bytes_packed(), 0);
+        assert_eq!(stats.segments_packed(), 0);
+    }
+
+    #[test]
+    fn transfers_outstanding_counts_the_transfer_numbers_held() {
+        let mut s = Sender::new(
+            SenderConfig {
+                pdu_size: PduSize::try_from(64).unwrap(),
+                ..SenderConfig::default()
+            },
+            0,
+        );
+        let segmented = || Bytes::from(vec![0x9F; 200]);
+        assert_eq!(s.transfers_outstanding(), 0);
+        let first = s.enqueue(segmented(), SendOptions::default()).unwrap();
+        s.enqueue(segmented(), SendOptions::default()).unwrap();
+        // A bundle that fits one PDU holds no transfer number.
+        s.enqueue(Bytes::from(vec![0x9F; 20]), SendOptions::default())
+            .unwrap();
+        assert_eq!(s.transfers_outstanding(), 2);
+
+        assert!(s.cancel(first));
+        assert_eq!(s.transfers_outstanding(), 1);
+        // The other's number is released when its End is packed.
+        while s.next_pdu().is_some() {}
+        assert_eq!(s.transfers_outstanding(), 0);
+    }
+
+    #[test]
+    fn stats_count_transfers_and_cancels_and_not_a_refusal() {
+        let config = SenderConfig::default();
+        let window = usize::from(config.window_size.get());
+        let segmented = || Bytes::from(vec![0x9F; 2 * config.pdu_size.get()]);
+        let mut s = Sender::new(config, 0);
+
+        let ids: Vec<_> = (0..window)
+            .map(|_| s.enqueue(segmented(), SendOptions::default()).unwrap())
+            .collect();
+        assert!(matches!(
+            s.enqueue(segmented(), SendOptions::default()),
+            Err(Error::WindowFull { .. })
+        ));
+        // A bundle that fits one PDU takes no transfer number.
+        let fitting = s
+            .enqueue(Bytes::from_static(&[0x9F, 0xFF]), SendOptions::default())
+            .unwrap();
+        // The refusal is not counted, and nothing else has happened.
+        let admitted = s.stats();
+        assert_eq!(admitted.transfers_allocated(), window as u64);
+        assert_eq!(admitted.bundles_cancelled(), 0);
+        assert_eq!(admitted.transfer_cancels_queued(), 0);
+        assert_eq!(admitted.pdus_packed(), 0);
+
+        // The oldest transfer has a segment out once a PDU is packed, so
+        // cancelling it queues a Transfer Cancel; the others, and the
+        // fitting bundle, are removed with nothing sent.
+        assert!(s.next_pdu().is_some());
+        let packed = s.stats();
+        assert!(s.cancel(ids[0]));
+        assert!(s.cancel(ids[1]));
+        assert!(s.cancel(fitting));
+        assert!(!s.cancel(fitting));
+        let cancelled = s.stats();
+        assert_eq!(cancelled.transfers_allocated(), window as u64);
+        assert_eq!(cancelled.bundles_cancelled(), 3);
+        assert_eq!(cancelled.transfer_cancels_queued(), 1);
+        // A cancel packs nothing.
+        assert_eq!(packed.pdus_packed(), 1);
+        assert_eq!(cancelled.pdus_packed(), 1);
+        assert_eq!(
+            cancelled.bundle_bytes_packed(),
+            packed.bundle_bytes_packed()
+        );
+    }
 
     #[test]
     fn unsegmented_ids_wrap_across_message_and_bare() {
